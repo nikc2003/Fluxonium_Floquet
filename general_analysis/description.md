@@ -4,4 +4,4 @@ Includes Xiao and branch analysis to:
   2. visualize and pinpoint character exchanges/branch swaps
 
 Files here should support sweeps against drive frequency or flux and composite model handling
-as well as general Hamiltonian/spectrum analysis with the bare system. 
+as well as general Hamiltonian/spectrum analysis with the bare basis (bare meaning no drive-induced dressing on eigenstates). 
