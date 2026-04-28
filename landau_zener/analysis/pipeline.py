@@ -1,0 +1,536 @@
+"""
+landau_zener/analysis/pipeline.py
+the full workflow  
+1. do a single point survey and zoom in
+2, single-point targeted windows (slope-based)
+3. drive sweep/flux sweep (optionally parallelkized)
+4. targeted transition drive sweep (bare_a->bare_b, fixed n-photon)
+"""
+
+from __future__ import annotations
+from landau_zener.physics.hamiltonian import get_H0_H1_for_flux
+from landau_zener.utils.units import angular_to_ghz, angular_to_mhz  
+import os
+import inspect
+from dataclasses import dataclass, asdict, is_dataclass
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+import pandas as pd
+import floquet as ft
+
+from landau_zener.floquet.sweep import (
+    FloquetSweep,
+    floquet_sweep_vs_chi,
+    diabatic_energies_floquet,
+    basis_weights,
+)
+from landau_zener.analysis.detection import (
+    BranchHybridizationDetectConfig,
+    ReferenceHybridizationConfig,
+    detect_branch_hybridizations,
+    detect_reference_level_swaps,
+    analyze_pair_event_near_k,
+    infer_partner_bare_level_for_ref_swap,
+)
+from landau_zener.analysis.metrics import IsolationConfig, CrowdingConfig, event_with_metrics
+from landau_zener.analysis.slope_target import (
+    SlopeConfig,
+    low_chi_diabatic_slopes,
+    predict_candidate_windows,
+    predict_candidate_windows_for_pair,
+    WindowCand,
+)
+from landau_zener.analysis.detuning_fit import LinearDetuningFitConfig
+from landau_zener.analysis.photon import (
+    bare_energies_rad_ns,
+    physical_photon_number,
+    floquet_replica_label,
+)
+from landau_zener.utils.units import ghz_to_angular, wrap_to_bz
+from landau_zener.utils.io import ensure_dir, save_df_csv
+from landau_zener.utils.parallel import process_pool_map
+
+
+
+@dataclass
+class SurveyConfig:
+    nchi_survey: int = 5001
+    restrict_branches: Optional[Sequence[int]] = None
+
+
+@dataclass
+class ZoomConfig:
+    enable_zoom: bool = False
+    nchi_zoom: int = 4001
+    window_factor: float = 8.0
+    min_span_fraction_of_survey: float = 0.03
+    max_zoom_events: Optional[int] = None
+
+
+@dataclass
+class RelevanceFilterConfig:
+    P_ad_min: float = 0.6
+    P_dia_max: Optional[float] = None
+    require_isolated_pair: bool = True
+    iso_ratio_min: Optional[float] = 4.0
+    w_ref_min_over_set: Optional[float] = 0.05
+    max_events_keep: Optional[int] = None
+
+
+
+def _to_dict(obj: Any) -> Dict[str, Any]:
+    if obj is None:
+        return {}
+    if isinstance(obj, dict):
+        return dict(obj)
+    if is_dataclass(obj):
+        return asdict(obj)
+    try:
+        return dict(vars(obj))
+    except TypeError:
+        return {"value": obj}
+
+
+def _filter_kwargs_for_ctor(cls: Any, d: Dict[str, Any]) -> Dict[str, Any]:
+    d = dict(d)
+    try:
+        sig = inspect.signature(cls)
+        params = sig.parameters
+        if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+            return d
+        allowed = set(params.keys())
+        return {k: v for k, v in d.items() if k in allowed}
+    except Exception:
+        return d
+
+
+def _make_ft_options(options_like: Any) -> ft.Options:
+    d = _filter_kwargs_for_ctor(ft.Options, _to_dict(options_like))
+    return ft.Options(**d)
+
+#filter the events
+def filter_events_df(df: pd.DataFrame, filt: RelevanceFilterConfig) -> pd.DataFrame:
+    if df is None or len(df) == 0:
+        return df
+    d = df.copy()
+
+    if "P_ad" in d.columns and np.isfinite(filt.P_ad_min):
+        d["passed_Pad"] = d["P_ad"].fillna(-np.inf) >= float(filt.P_ad_min)
+    else:
+        d["passed_Pad"] = True
+
+    if ("P_dia" in d.columns) and (filt.P_dia_max is not None) and np.isfinite(filt.P_dia_max):
+        d["passed_Pdia"] = d["P_dia"].fillna(np.inf) <= float(filt.P_dia_max)
+    else:
+        d["passed_Pdia"] = True
+
+    if filt.require_isolated_pair and "iso_ratio_pair" in d.columns and filt.iso_ratio_min is not None:
+        d["passed_iso"] = d["iso_ratio_pair"].fillna(-np.inf) >= float(filt.iso_ratio_min)
+    else:
+        d["passed_iso"] = True
+
+    if ("w_ref_max_over_set" in d.columns) and (filt.w_ref_min_over_set is not None) and np.isfinite(filt.w_ref_min_over_set):
+        d["passed_ref_overlap"] = d["w_ref_max_over_set"].fillna(0.0) >= float(filt.w_ref_min_over_set)
+    else:
+        d["passed_ref_overlap"] = True
+
+    d["passed_all"] = d["passed_Pad"] & d["passed_Pdia"] & d["passed_iso"] & d["passed_ref_overlap"]
+    out = d[d["passed_all"]].reset_index(drop=True)
+    if filt.max_events_keep is not None:
+        out = out.head(int(filt.max_events_keep)).reset_index(drop=True)
+    return out
+
+
+#single point windows
+
+def run_targeted_windows_single_point(
+    *,
+    dim_q: int,
+    qubit_params: Dict[str, Any],
+    flux: float,
+    omega_d: float,
+    chi_range_GHz: Tuple[float, float],
+    options: ft.Options,
+    detect_cfg: BranchHybridizationDetectConfig,
+    lin_cfg: LinearDetuningFitConfig,
+    iso_cfg: Optional[IsolationConfig] = None,
+    crowd_cfg: Optional[CrowdingConfig] = None,
+    kappa_res: Optional[float] = None,
+    slope_cfg: SlopeConfig = SlopeConfig(),
+    nchi_window: int = 801,
+    restrict_branches: Optional[Sequence[int]] = None,
+    target_bare_pair: Optional[Tuple[int, int]] = None,
+    target_n_photon: Optional[int] = None,
+    n_cross: int = 10,  #dummy variabl elabel 
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """
+    slope targeted mode: low-chi slope fit -> predict chi windows -> scan locally -> detect events -> metrics
+
+    IMPORTANT=>
+      target_n_photon is interpreted as PHYSICAL photon count using bare energies,
+      not the wrapped-quasienergy (Floquet) index.
+    """
+    chi_min = ghz_to_angular(chi_range_GHz[0])
+    chi_max = ghz_to_angular(chi_range_GHz[1])
+
+    low = low_chi_diabatic_slopes(
+        dim_q=dim_q,
+        qubit_params=qubit_params,
+        flux=float(flux),
+        omega_d=float(omega_d),
+        options=options,
+        slope_cfg=slope_cfg,
+    )
+    eps0 = low["eps0"]
+    slopes = low["slopes"]
+    if target_bare_pair is None:
+        cands = predict_candidate_windows(
+            eps0=eps0,
+            slopes=slopes,
+            omega_d=float(omega_d),
+            chi_min=chi_min,
+            chi_max=chi_max,
+            cfg=slope_cfg,
+        )
+    else:
+        a, b = map(int, target_bare_pair)
+
+        cands = predict_candidate_windows_for_pair(
+            eps0=eps0,
+            slopes=slopes,
+            omega_d=float(omega_d),
+            chi_min=chi_min,
+            chi_max=chi_max,
+            cfg=slope_cfg,
+            bare_a=a,
+            bare_b=b,
+            n_photon=None,
+        )
+
+    E_bare = bare_energies_rad_ns(qubit_params=qubit_params, flux=float(flux), dim_q=int(dim_q))
+
+    events_all: List[Dict[str, Any]] = []
+
+    for cand in cands:
+        a_win = max(chi_min, float(cand.chi_pred) - float(cand.half_window))
+        b_win = min(chi_max, float(cand.chi_pred) + float(cand.half_window))
+        if not (b_win > a_win):
+            continue
+
+        chi_vals = np.linspace(a_win, b_win, int(nchi_window))
+        sweep = floquet_sweep_vs_chi(
+            dim_q=dim_q,
+            qubit_params=qubit_params,
+            flux=float(flux),
+            omega_d=float(omega_d),
+            chi_vals=chi_vals,
+            options=options,
+        )
+
+        local_events = detect_branch_hybridizations(sweep, detect_cfg, restrict_branches=restrict_branches)
+
+        for ev in local_events:
+            ev2 = event_with_metrics(
+                sweep, ev,
+                detect_observable=detect_cfg.observable,
+                obs_edge_factor=detect_cfg.obs_edge_factor,
+                min_edge_offset_pts=detect_cfg.min_edge_offset_pts,
+                iso_cfg=iso_cfg,
+                crowd_cfg=crowd_cfg,
+                kappa_res=kappa_res,
+                restrict_branches_for_crowd=restrict_branches,
+                ref_levels_for_overlap=(0, 1, 2),
+                lin_cfg=lin_cfg,
+                chi_max_global=float(chi_max),
+            )
+
+            ev2["chi_pred"] = float(cand.chi_pred)
+            ev2["n_zone_pred"] = int(getattr(cand, "n_photon", 0))  
+            ev2["sdiff_pred"] = float(getattr(cand, "sdiff", np.nan))
+
+            if target_bare_pair is not None:
+                ta, tb = sorted(map(int, target_bare_pair))
+                ba = int(ev2.get("bare_a", -999))
+                bb = int(ev2.get("bare_b", -999))
+                ba_s, bb_s = sorted([ba, bb])
+                if (ba_s, bb_s) != (ta, tb):
+                    continue
+
+            if "bare_a" in ev2 and "bare_b" in ev2:
+                ba = int(ev2["bare_a"])
+                bb = int(ev2["bare_b"])
+                pinfo = physical_photon_number(E_bare=E_bare, bare_a=ba, bare_b=bb, omega_d=float(omega_d))
+                ev2.update(pinfo)
+                if np.isfinite(ev2.get("n_photon_phys", np.nan)):
+                    ev2["floquet_transition_label"] = floquet_replica_label(
+                        bare_a=ba,
+                        bare_b=bb,
+                        n_photon_phys=int(ev2["n_photon_phys"]),
+                        n_cross=int(n_cross),
+                    )
+
+            if target_n_photon is not None:
+                nabs = ev2.get("n_photon_phys_abs", None)
+                if nabs is None or (int(nabs) != int(target_n_photon)):
+                    continue
+
+            events_all.append(ev2)
+
+    df = pd.DataFrame(events_all)
+    if len(df) > 0:
+        sort_cols = [c for c in ["bare_a", "bare_b", "chi_star"] if c in df.columns]
+        if sort_cols:
+            df = df.sort_values(sort_cols).reset_index(drop=True)
+
+    debug = dict(
+        low_chi_sweep=low["sweep_low_power"],
+        eps0=eps0,
+        slopes=slopes,
+        r2=low["r2"],
+        candidates=cands,
+    )
+    return df, debug
+
+
+def run_targeted_pair_fullchi_single_point(
+    *,
+    dim_q: int,
+    qubit_params: Dict[str, Any],
+    flux: float,
+    omega_d: float,
+    chi_range_GHz: Tuple[float, float],
+    options: ft.Options,
+    detect_cfg: BranchHybridizationDetectConfig,
+    lin_cfg: LinearDetuningFitConfig,
+    iso_cfg: Optional[IsolationConfig] = None,
+    crowd_cfg: Optional[CrowdingConfig] = None,
+    kappa_res: Optional[float] = None,
+    target_bare_pair: Tuple[int, int],
+    target_n_photon: Optional[int] = None,
+    n_cross: int = 10,
+    nchi_sweep: int = 1201,
+    carrier_avg_half_window_pts: int = 5,
+    min_target_branch_weight: float = 0.05,
+    pair_gap_search_half_window_pts: int = 80,
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """
+    targeted detector for one requested bare pair (a,b).
+    Procedure:
+      1.  run a full chi sweep for this frequency
+      2. compute projected diabatic target-pair detuning
+      3. find k_det = argmin |wrap(detuning, omega_d)|
+      4.  around k_det, identify the two branches carrying the largest combined (a,b) weight
+      5. run local avoided-crossing analysis only for that branch pair
+    """
+    a, b = sorted(map(int, target_bare_pair))
+
+    chi_vals = ghz_to_angular(np.linspace(chi_range_GHz[0], chi_range_GHz[1], int(nchi_sweep)))
+    sweep = floquet_sweep_vs_chi(
+        dim_q=dim_q,
+        qubit_params=qubit_params,
+        flux=float(flux),
+        omega_d=float(omega_d),
+        chi_vals=chi_vals,
+        options=options,
+    )
+
+    E_bare = bare_energies_rad_ns(qubit_params=qubit_params, flux=float(flux), dim_q=int(dim_q))
+    pinfo = physical_photon_number(E_bare=E_bare, bare_a=a, bare_b=b, omega_d=float(omega_d))
+    if target_n_photon is not None:
+        if int(pinfo["n_photon_phys_abs"]) != int(target_n_photon):
+            return pd.DataFrame(), dict(
+                reason="physical photon order mismatch at this frequency",
+                sweep=sweep,
+                physical_photon_info=pinfo,
+            )
+    eps_dia = diabatic_energies_floquet(sweep)
+    det_target = wrap_to_bz(eps_dia[:, b] - eps_dia[:, a], float(omega_d))
+    abs_det = np.abs(det_target)
+    k_det = int(np.argmin(abs_det))
+    W = basis_weights(sweep.modes)  # (nchi, nb, dim)
+    K = W.shape[0]
+    k0 = max(0, k_det - int(carrier_avg_half_window_pts))
+    k1 = min(K, k_det + int(carrier_avg_half_window_pts) + 1)
+    branch_score = np.mean(W[k0:k1, :, a] + W[k0:k1, :, b], axis=0)
+    top2 = np.argsort(branch_score)[-2:]
+    bi, bj = sorted(int(t) for t in top2)
+    if float(branch_score[top2[0]]) < float(min_target_branch_weight) or float(branch_score[top2[1]]) < float(min_target_branch_weight):
+        return pd.DataFrame(), dict(
+            reason="target branches never carry enough weight",
+            sweep=sweep,
+            physical_photon_info=pinfo,
+            k_det=int(k_det),
+            branch_score=branch_score,
+        )
+
+    ev = analyze_pair_event_near_k(
+        sweep,
+        branch_i=int(bi),
+        branch_j=int(bj),
+        k_center=int(k_det),
+        g2_fit_half_window=int(detect_cfg.g2_fit_half_window),
+        gap_search_half_window_pts=int(pair_gap_search_half_window_pts),
+        event_prefix="TPAIR",
+        ref_level=None,
+    )
+    if ev is None:
+        return pd.DataFrame(), dict(
+            reason="pair-local g2 fit failed",
+            sweep=sweep,
+            physical_photon_info=pinfo,
+            k_det=int(k_det),
+            branch_score=branch_score,
+            branch_i=int(bi),
+            branch_j=int(bj),
+        )
+    ev["event_type"] = "target_pair"
+    ev["swap_observable"] = str(detect_cfg.observable)  
+    ev["bare_a"] = int(a)
+    ev["bare_b"] = int(b)
+    ev["k_det"] = int(k_det)
+    ev["target_detuning_center"] = float(det_target[k_det])
+    ev["target_detuning_center_MHz"] = float(angular_to_mhz(det_target[k_det]))
+    ev["target_branch_i_score"] = float(branch_score[bi])
+    ev["target_branch_j_score"] = float(branch_score[bj])
+    ev["target_support_sum"] = float(branch_score[bi] + branch_score[bj])
+    ev = event_with_metrics(
+        sweep, ev,
+        detect_observable=detect_cfg.observable,
+        obs_edge_factor=detect_cfg.obs_edge_factor,
+        min_edge_offset_pts=detect_cfg.min_edge_offset_pts,
+        iso_cfg=iso_cfg,
+        crowd_cfg=crowd_cfg,
+        kappa_res=kappa_res,
+        restrict_branches_for_crowd=None,
+        ref_levels_for_overlap=(0, 1, 2),
+        lin_cfg=lin_cfg,
+        chi_max_global=float(chi_vals[-1]),
+    )
+    ev.update(pinfo)
+    ev["floquet_transition_label"] = floquet_replica_label(
+        bare_a=a,
+        bare_b=b,
+        n_photon_phys=int(pinfo["n_photon_phys"]),
+        n_cross=int(n_cross),
+    )
+    df = pd.DataFrame([ev])
+    return df, dict(
+        sweep=sweep,
+        physical_photon_info=pinfo,
+        k_det=int(k_det),
+        branch_score=branch_score,
+        branch_i=int(bi),
+        branch_j=int(bj),
+    )
+
+def _drive_sweep_target_transition_worker(job: Dict[str, Any]) -> pd.DataFrame:
+    """
+    write later
+    """
+    fGHz = float(job["fGHz"])
+    omega_d = ghz_to_angular(fGHz)
+
+    outdir = str(job["outdir"])
+    odir = os.path.join(outdir, f"fd_{fGHz:.6f}GHz")
+
+    options = _make_ft_options(job["options"])
+    detect_cfg = BranchHybridizationDetectConfig(**_to_dict(job["detect_cfg"]))
+    lin_cfg = LinearDetuningFitConfig(**_to_dict(job["lin_cfg"]))
+    iso_cfg = IsolationConfig(**_to_dict(job["iso_cfg"])) if job.get("iso_cfg") is not None else None
+    crowd_cfg = CrowdingConfig(**_to_dict(job["crowd_cfg"])) if job.get("crowd_cfg") is not None else None
+
+    df_b, _dbg = run_targeted_pair_fullchi_single_point(
+        dim_q=int(job["dim_q"]),
+        qubit_params=dict(job["qubit_params"]),
+        flux=float(job["flux"]),
+        omega_d=float(omega_d),
+        chi_range_GHz=tuple(job["chi_range_GHz"]),
+        options=options,
+        detect_cfg=detect_cfg,
+        lin_cfg=lin_cfg,
+        iso_cfg=iso_cfg,
+        crowd_cfg=crowd_cfg,
+        kappa_res=float(job["kappa_res"]) if job.get("kappa_res") is not None else None,
+        target_bare_pair=tuple(job["target_bare_pair"]),
+        target_n_photon=int(job["target_n_photon"]) if job.get("target_n_photon") is not None else None,
+        n_cross=int(job.get("n_cross", 10)),
+        nchi_sweep=int(job.get("nchi_sweep", 1201)),
+    )
+
+    if df_b is not None and len(df_b) > 0:
+        ensure_dir(odir)
+        save_df_csv(df_b, os.path.join(odir, "events_target_branch.csv"))
+
+    return df_b
+
+def run_drive_sweep_target_transition(
+    *,
+    drive_freqs_GHz: Sequence[float],
+    dim_q: int,
+    qubit_params: Dict[str, Any],
+    flux: float,
+    chi_range_GHz: Tuple[float, float],
+    options: ft.Options,
+    outdir: str,
+    detect_cfg: BranchHybridizationDetectConfig,
+    iso_cfg: Optional[IsolationConfig],
+    crowd_cfg: Optional[CrowdingConfig],
+    kappa_res: Optional[float],
+    lin_cfg: LinearDetuningFitConfig,
+    slope_cfg: SlopeConfig,
+    target_bare_pair: Tuple[int, int],
+    target_n_photon: Optional[int],
+    parallel: bool = False,
+    max_workers: int = 4,
+    n_cross: int = 10,
+    nchi_sweep: int = 1201,
+) -> pd.DataFrame:
+    """
+    narrow frequency list -> slope-targeted windows -> keep only target bare pair
+    and physical n-photon condition.
+    """
+    ensure_dir(outdir)
+    drive_freqs_GHz = list(map(float, drive_freqs_GHz))
+
+    jobs: List[Dict[str, Any]] = []
+    for fGHz in drive_freqs_GHz:
+        jobs.append(dict(
+            fGHz=float(fGHz),
+            outdir=str(outdir),
+            dim_q=int(dim_q),
+            qubit_params=dict(qubit_params),
+            flux=float(flux),
+            chi_range_GHz=tuple(chi_range_GHz),
+            options=_to_dict(options),
+            detect_cfg=_to_dict(detect_cfg),
+            iso_cfg=_to_dict(iso_cfg) if iso_cfg is not None else None,
+            crowd_cfg=_to_dict(crowd_cfg) if crowd_cfg is not None else None,
+            kappa_res=float(kappa_res) if kappa_res is not None else None,
+            lin_cfg=_to_dict(lin_cfg),
+            slope_cfg=_to_dict(slope_cfg),
+            target_bare_pair=tuple(map(int, target_bare_pair)),
+            target_n_photon=int(target_n_photon) if target_n_photon is not None else None,
+            nchi_window=801,
+            n_cross=int(n_cross),
+            nchi_sweep=int(nchi_sweep),
+        ))
+
+    if parallel:
+        dfs = process_pool_map(
+            _drive_sweep_target_transition_worker,
+            jobs,
+            max_workers=int(max_workers),
+            mp_start_method="spawn",
+        )
+    else:
+        dfs = [_drive_sweep_target_transition_worker(j) for j in jobs]
+
+    rows = [d for d in dfs if d is not None and len(d) > 0]
+    out = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+
+    if len(out) > 0:
+        save_df_csv(out, os.path.join(outdir, "drive_sweep_target_branch_all.csv"))
+
+    return out
+
